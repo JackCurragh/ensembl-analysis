@@ -17,28 +17,39 @@ Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::FullAnnotation_conf
 End-to-end genome annotation eHive pipeline using the Nextflow subpipelines.
 
 Dependency graph:
-  LoadAssembly
-       │ genome_fasta, metadata
-       ▼
-  RepeatMasking
-       │ softmasked_fasta
-       ├──────────────────────────────────────────────┐
-       ▼                                              ▼
-  [Parallel annotation layers]               ShortNcrna
-  RnaSeq / BestTargeted / Projection /
-  AbInitio / RefseqImport / Igtr /
-  LongRead / GenblastHomology
-       │ GFF3 files
-       └─────────────┐
-                     ▼
-               Consolidate
-                     │
-                     ▼
-             ConsumeConsolidated
 
-All Nextflow subpipelines are launched by HiveRunNextflow.  Each pipeline
-writes output_manifest.json; dataflow on channel 2 passes file paths to the
-next stage.
+  Seed
+   │
+   ▼
+  RunLoadAssembly          (downloads FASTA + synonyms TSV)
+   │ channel 1
+   ▼
+  RunRepeatMasking          (softmasks genome)
+   │ channel 1
+   ▼
+  FanAnnotationLayers  ─── semaphore group A ────────────────────┐
+   │ 1->A                                                         │
+   ├── RunRnaSeq                                                  │
+   ├── RunBestTargeted                                            │
+   ├── RunProjection                                              │
+   ├── RunAbInitio                                                │
+   ├── RunIgtr                                                    │
+   ├── RunLongRead                                                │
+   ├── RunGenblastHomology                                        │
+   ├── RunShortNcrna                                              │
+   └── RunRefseqImport                                            │
+   │ A->1 (triggered when ALL 9 annotation layers complete)       │
+   ▼ ◄─────────────────────────────────────────────────────────────┘
+  RunConsolidate            (scans outdir/**/*.gff3 for all GFF3s)
+   │ channel 2
+   ▼
+  ConsumeConsolidatedOutput
+
+All input paths (genome_fasta, softmasked_fasta, synonyms_tsv) are computed
+from the assembly_accession + assembly_name at init time using the known
+publishDir conventions of each Nextflow pipeline.  This avoids relying on
+eHive channel-2 dataflow for sequential path-passing, which would require
+per-output type filtering.
 
 Usage (HPC production — MySQL + SLURM + Singularity):
 
@@ -102,8 +113,8 @@ sub default_options {
         source_gff3                 => undef,   # source annotation (projection)
 
         # ----------------------------------------------------------------
-        # Nextflow infrastructure (nf_pipeline_dir from base is unused here;
-        # nf_base_dir is the parent of all pipelines/ subdirs)
+        # Nextflow infrastructure (nf_base_dir is the parent of all
+        # pipelines/ subdirs in ensembl-genes-nf)
         # ----------------------------------------------------------------
         nf_base_dir                 => undef,   # e.g. /nfs/production/.../ensembl-genes-nf/pipelines
 
@@ -132,7 +143,7 @@ sub _pipeline_dir {
     return catdir($self->o('nf_base_dir'), $name);
 }
 
-# Resolve per-pipeline outdir
+# Resolve per-pipeline output subdirectory
 sub _outdir {
     my ($self, $name) = @_;
     return catdir($self->o('outdir'), $name);
@@ -142,95 +153,117 @@ sub _outdir {
 sub pipeline_analyses {
     my ($self) = @_;
 
+    # ----------------------------------------------------------------
+    # Precompute stable file paths from known publishDir conventions.
+    #
+    # These paths are deterministic given assembly_accession + assembly_name
+    # and the per-pipeline outdir.  Using hardcoded paths avoids having to
+    # filter channel-2 dataflow outputs by type when passing files between
+    # sequential pipeline stages.
+    #
+    # Conventions:
+    #   load_assembly   → outdir/load_assembly/genome/<acc>_<name>_genomic.fna
+    #                     outdir/load_assembly/genome/<acc>_<name>.synonyms.tsv
+    #   repeat_masking  → outdir/repeat_masking/genome/<acc>_<name>_genomic.softmasked.fa
+    # ----------------------------------------------------------------
+    my $assembly_id = $self->o('assembly_accession') . '_' . $self->o('assembly_name');
+
+    my $genome_fasta = catfile(
+        $self->_outdir('load_assembly'), 'genome', "${assembly_id}_genomic.fna"
+    );
+    my $synonyms_tsv = catfile(
+        $self->_outdir('load_assembly'), 'genome', "${assembly_id}.synonyms.tsv"
+    );
+    my $softmasked_fasta = catfile(
+        $self->_outdir('repeat_masking'), 'genome', "${assembly_id}_genomic.softmasked.fa"
+    );
+
     return [
 
         # ================================================================
-        # Stage 0: seed
+        # Stage 0: Seed
         # ================================================================
         {
             -logic_name  => 'Seed',
             -module      => 'Bio::EnsEMBL::Hive::RunnableDB::Dummy',
             -input_ids   => [{}],
-            -flow_into   => { 1 => ['RunLoadAssembly', 'RunRefseqImport'] },
+            -flow_into   => { 1 => 'RunLoadAssembly' },
             -meadow_type => 'LOCAL',
         },
 
         # ================================================================
-        # Stage 1a: load genome assembly from NCBI
+        # Stage 1: Load genome assembly (downloads FASTA + synonyms TSV)
+        # Runs sequentially before repeat masking.
+        # nextflow_dataflow_outputs => 0: downstream paths are hardcoded.
         # ================================================================
         {
             -logic_name  => 'RunLoadAssembly',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
             -parameters  => {
-                nextflow_pipeline_dir  => $self->_pipeline_dir('load_assembly'),
-                nextflow_pipeline_name => 'load_assembly',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->_outdir('load_assembly'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => {
+                nextflow_pipeline_dir     => $self->_pipeline_dir('load_assembly'),
+                nextflow_pipeline_name    => 'load_assembly',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->_outdir('load_assembly'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
                     assembly_accession => $self->o('assembly_accession'),
                     assembly_name      => $self->o('assembly_name'),
                     outdir             => $self->_outdir('load_assembly'),
                 },
-                nextflow_dataflow_outputs => 1,
-                nextflow_binary => $self->_nf_binary(),
+                nextflow_dataflow_outputs => 0,
+                nextflow_binary           => $self->_nf_binary(),
             },
             -rc_name         => 'small_long',
-            -flow_into       => { 2 => 'CollectAssemblyOutputs' },
+            -flow_into       => { 1 => 'RunRepeatMasking' },
             -max_retry_count => 1,
         },
 
-        # Accumulate load_assembly outputs (genome_fasta) before repeat masking
-        {
-            -logic_name        => 'CollectAssemblyOutputs',
-            -module            => 'Bio::EnsEMBL::Hive::RunnableDB::Dummy',
-            -flow_into         => { 1 => 'RunRepeatMasking' },
-            -meadow_type       => 'LOCAL',
-        },
-
         # ================================================================
-        # Stage 1b: RepeatMasking (waits for genome FASTA from LoadAssembly)
+        # Stage 2: Repeat masking (uses genome FASTA from stage 1)
+        # Runs sequentially before the annotation fan.
+        # BEDTOOLS_MASKFASTA publishes softmasked.fa → outdir/genome/
+        # nextflow_dataflow_outputs => 0: downstream path is hardcoded.
         # ================================================================
         {
             -logic_name  => 'RunRepeatMasking',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
             -parameters  => {
-                nextflow_pipeline_dir  => $self->_pipeline_dir('repeat_masking'),
-                nextflow_pipeline_name => 'repeat_masking',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->_outdir('repeat_masking'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => {
-                    # genome_fasta will be set from the #path# dataflow param
-                    # when load_assembly outputs a softmasked_fasta type.
-                    # For now bind directly; replace with '#path#' when
-                    # load_assembly→RepeatMasking wiring is validated.
-                    genome_fasta       => '#path#',
+                nextflow_pipeline_dir     => $self->_pipeline_dir('repeat_masking'),
+                nextflow_pipeline_name    => 'repeat_masking',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->_outdir('repeat_masking'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
+                    genome_fasta       => $genome_fasta,
+                    repbase_library    => $self->o('repbase_library'),
+                    custom_library     => $self->o('custom_repeat_library'),
                     species            => $self->o('repeat_species'),
                     skip_repeatmodeler => 1,
                     outdir             => $self->_outdir('repeat_masking'),
                 },
-                nextflow_dataflow_outputs => 1,
-                nextflow_binary => $self->_nf_binary(),
+                nextflow_dataflow_outputs => 0,
+                nextflow_binary           => $self->_nf_binary(),
             },
             -rc_name         => 'large_long',
-            # Fan out to all parallel annotation stages
-            -flow_into       => {
-                2 => [
-                    'FanAnnotationLayers',
-                ],
-            },
+            -flow_into       => { 1 => 'FanAnnotationLayers' },
             -max_retry_count => 1,
         },
 
-        # After repeat masking, start all annotation layers in parallel
+        # ================================================================
+        # Stage 3: Fan to all 9 annotation pipelines in parallel.
+        #
+        # The 1->A / A->1 eHive semaphore pattern ensures RunConsolidate
+        # is only triggered after ALL annotation layers complete.  Each
+        # RunXxx receives nextflow_dataflow_outputs => 0 so there are no
+        # channel-2 descendants that could race with the consolidation.
+        # ================================================================
         {
             -logic_name  => 'FanAnnotationLayers',
             -module      => 'Bio::EnsEMBL::Hive::RunnableDB::Dummy',
             -flow_into   => {
-                1 => [
+                '1->A' => [
                     'RunRnaSeq',
                     'RunBestTargeted',
                     'RunProjection',
@@ -239,60 +272,37 @@ sub pipeline_analyses {
                     'RunLongRead',
                     'RunGenblastHomology',
                     'RunShortNcrna',
+                    'RunRefseqImport',
                 ],
+                'A->1' => ['RunConsolidate'],
             },
             -meadow_type => 'LOCAL',
         },
 
-        # ================================================================
-        # Stage 1b parallel: RefSeq import (independent of repeat masking)
-        # ================================================================
-        {
-            -logic_name  => 'RunRefseqImport',
-            -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
-            -parameters  => {
-                nextflow_pipeline_dir  => $self->_pipeline_dir('refseq_import'),
-                nextflow_pipeline_name => 'refseq_import',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->_outdir('refseq_import'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => {
-                    assembly_refseq_accession => $self->o('assembly_refseq_accession'),
-                    assembly_name             => $self->o('assembly_name'),
-                    outdir                    => $self->_outdir('refseq_import'),
-                },
-                nextflow_dataflow_outputs => 1,
-                nextflow_binary => $self->_nf_binary(),
-            },
-            -rc_name         => 'small_long',
-            -flow_into       => { 2 => 'CollectLayerOutputs' },
-            -max_retry_count => 1,
-        },
+        # ----------------------------------------------------------------
+        # Stage 3 analyses — all use the softmasked genome from stage 2.
+        # RefseqImport uses the synonyms TSV from stage 1.
+        # ----------------------------------------------------------------
 
-        # ================================================================
-        # Stage 2: Parallel annotation layers (all receive softmasked genome path)
-        # ================================================================
         {
             -logic_name  => 'RunRnaSeq',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
             -parameters  => {
-                nextflow_pipeline_dir  => $self->_pipeline_dir('rnaseq'),
-                nextflow_pipeline_name => 'rnaseq',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->_outdir('rnaseq'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => {
-                    genome_fasta => '#path#',
+                nextflow_pipeline_dir     => $self->_pipeline_dir('rnaseq'),
+                nextflow_pipeline_name    => 'rnaseq',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->_outdir('rnaseq'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
+                    genome_fasta => $softmasked_fasta,
                     sample_sheet => $self->o('sample_sheet'),
                     outdir       => $self->_outdir('rnaseq'),
                 },
-                nextflow_dataflow_outputs => 1,
-                nextflow_binary => $self->_nf_binary(),
+                nextflow_dataflow_outputs => 0,
+                nextflow_binary           => $self->_nf_binary(),
             },
             -rc_name         => 'medium_long',
-            -flow_into       => { 2 => 'CollectLayerOutputs' },
             -max_retry_count => 1,
         },
 
@@ -300,23 +310,22 @@ sub pipeline_analyses {
             -logic_name  => 'RunBestTargeted',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
             -parameters  => {
-                nextflow_pipeline_dir  => $self->_pipeline_dir('best_targeted'),
-                nextflow_pipeline_name => 'best_targeted',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->_outdir('best_targeted'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => {
-                    genome_fasta   => '#path#',
-                    cdna_fasta     => $self->o('cdna_fasta'),
-                    protein_fasta  => $self->o('protein_fasta'),
-                    outdir         => $self->_outdir('best_targeted'),
+                nextflow_pipeline_dir     => $self->_pipeline_dir('best_targeted'),
+                nextflow_pipeline_name    => 'best_targeted',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->_outdir('best_targeted'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
+                    genome_fasta  => $softmasked_fasta,
+                    cdna_fasta    => $self->o('cdna_fasta'),
+                    protein_fasta => $self->o('protein_fasta'),
+                    outdir        => $self->_outdir('best_targeted'),
                 },
-                nextflow_dataflow_outputs => 1,
-                nextflow_binary => $self->_nf_binary(),
+                nextflow_dataflow_outputs => 0,
+                nextflow_binary           => $self->_nf_binary(),
             },
             -rc_name         => 'medium_long',
-            -flow_into       => { 2 => 'CollectLayerOutputs' },
             -max_retry_count => 1,
         },
 
@@ -324,23 +333,22 @@ sub pipeline_analyses {
             -logic_name  => 'RunProjection',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
             -parameters  => {
-                nextflow_pipeline_dir  => $self->_pipeline_dir('projection'),
-                nextflow_pipeline_name => 'projection',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->_outdir('projection'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => {
-                    query_fasta  => '#path#',
+                nextflow_pipeline_dir     => $self->_pipeline_dir('projection'),
+                nextflow_pipeline_name    => 'projection',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->_outdir('projection'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
+                    query_fasta  => $softmasked_fasta,
                     source_fasta => $self->o('source_fasta'),
                     source_gff3  => $self->o('source_gff3'),
                     outdir       => $self->_outdir('projection'),
                 },
-                nextflow_dataflow_outputs => 1,
-                nextflow_binary => $self->_nf_binary(),
+                nextflow_dataflow_outputs => 0,
+                nextflow_binary           => $self->_nf_binary(),
             },
             -rc_name         => 'medium_long',
-            -flow_into       => { 2 => 'CollectLayerOutputs' },
             -max_retry_count => 1,
         },
 
@@ -348,22 +356,21 @@ sub pipeline_analyses {
             -logic_name  => 'RunAbInitio',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
             -parameters  => {
-                nextflow_pipeline_dir  => $self->_pipeline_dir('ab_initio'),
-                nextflow_pipeline_name => 'ab_initio',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->_outdir('ab_initio'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => {
-                    genome_fasta => '#path#',
+                nextflow_pipeline_dir     => $self->_pipeline_dir('ab_initio'),
+                nextflow_pipeline_name    => 'ab_initio',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->_outdir('ab_initio'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
+                    genome_fasta => $softmasked_fasta,
                     species      => $self->o('assembly_name'),
                     outdir       => $self->_outdir('ab_initio'),
                 },
-                nextflow_dataflow_outputs => 1,
-                nextflow_binary => $self->_nf_binary(),
+                nextflow_dataflow_outputs => 0,
+                nextflow_binary           => $self->_nf_binary(),
             },
             -rc_name         => 'medium_long',
-            -flow_into       => { 2 => 'CollectLayerOutputs' },
             -max_retry_count => 1,
         },
 
@@ -371,22 +378,21 @@ sub pipeline_analyses {
             -logic_name  => 'RunIgtr',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
             -parameters  => {
-                nextflow_pipeline_dir  => $self->_pipeline_dir('igtr'),
-                nextflow_pipeline_name => 'igtr',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->_outdir('igtr'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => {
-                    genome_fasta  => '#path#',
+                nextflow_pipeline_dir     => $self->_pipeline_dir('igtr'),
+                nextflow_pipeline_name    => 'igtr',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->_outdir('igtr'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
+                    genome_fasta  => $softmasked_fasta,
                     igtr_proteins => $self->o('igtr_proteins'),
                     outdir        => $self->_outdir('igtr'),
                 },
-                nextflow_dataflow_outputs => 1,
-                nextflow_binary => $self->_nf_binary(),
+                nextflow_dataflow_outputs => 0,
+                nextflow_binary           => $self->_nf_binary(),
             },
-            -rc_name         => 'medium_long',
-            -flow_into       => { 2 => 'CollectLayerOutputs' },
+            -rc_name         => 'large_long',
             -max_retry_count => 1,
         },
 
@@ -394,23 +400,22 @@ sub pipeline_analyses {
             -logic_name  => 'RunLongRead',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
             -parameters  => {
-                nextflow_pipeline_dir  => $self->_pipeline_dir('long_read'),
-                nextflow_pipeline_name => 'long_read',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->_outdir('long_read'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => {
-                    genome_fasta => '#path#',
+                nextflow_pipeline_dir     => $self->_pipeline_dir('long_read'),
+                nextflow_pipeline_name    => 'long_read',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->_outdir('long_read'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
+                    genome_fasta => $softmasked_fasta,
                     sample_sheet => $self->o('long_read_sample_sheet'),
                     protein_db   => $self->o('protein_db'),
                     outdir       => $self->_outdir('long_read'),
                 },
-                nextflow_dataflow_outputs => 1,
-                nextflow_binary => $self->_nf_binary(),
+                nextflow_dataflow_outputs => 0,
+                nextflow_binary           => $self->_nf_binary(),
             },
             -rc_name         => 'large_long',
-            -flow_into       => { 2 => 'CollectLayerOutputs' },
             -max_retry_count => 1,
         },
 
@@ -418,22 +423,21 @@ sub pipeline_analyses {
             -logic_name  => 'RunGenblastHomology',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
             -parameters  => {
-                nextflow_pipeline_dir  => $self->_pipeline_dir('genblast_homology'),
-                nextflow_pipeline_name => 'genblast_homology',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->_outdir('genblast_homology'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => {
-                    genome_fasta  => '#path#',
+                nextflow_pipeline_dir     => $self->_pipeline_dir('genblast_homology'),
+                nextflow_pipeline_name    => 'genblast_homology',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->_outdir('genblast_homology'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
+                    genome_fasta  => $softmasked_fasta,
                     uniprot_fasta => $self->o('uniprot_fasta'),
                     outdir        => $self->_outdir('genblast_homology'),
                 },
-                nextflow_dataflow_outputs => 1,
-                nextflow_binary => $self->_nf_binary(),
+                nextflow_dataflow_outputs => 0,
+                nextflow_binary           => $self->_nf_binary(),
             },
             -rc_name         => 'medium_long',
-            -flow_into       => { 2 => 'CollectLayerOutputs' },
             -max_retry_count => 1,
         },
 
@@ -441,54 +445,73 @@ sub pipeline_analyses {
             -logic_name  => 'RunShortNcrna',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
             -parameters  => {
-                nextflow_pipeline_dir  => $self->_pipeline_dir('short_ncrna'),
-                nextflow_pipeline_name => 'short_ncrna',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->_outdir('short_ncrna'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => {
-                    genome_fasta => '#path#',
+                nextflow_pipeline_dir     => $self->_pipeline_dir('short_ncrna'),
+                nextflow_pipeline_name    => 'short_ncrna',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->_outdir('short_ncrna'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
+                    genome_fasta => $softmasked_fasta,
                     rfam_cm      => $self->o('rfam_cm'),
                     outdir       => $self->_outdir('short_ncrna'),
                 },
-                nextflow_dataflow_outputs => 1,
-                nextflow_binary => $self->_nf_binary(),
+                nextflow_dataflow_outputs => 0,
+                nextflow_binary           => $self->_nf_binary(),
             },
             -rc_name         => 'medium_long',
-            -flow_into       => { 2 => 'CollectLayerOutputs' },
+            -max_retry_count => 1,
+        },
+
+        {
+            # RefseqImport doesn't need the softmasked genome; it runs in
+            # parallel with the other annotation layers using the synonyms TSV
+            # produced by LoadAssembly (load_assembly/genome/<acc>_<name>.synonyms.tsv).
+            -logic_name  => 'RunRefseqImport',
+            -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
+            -parameters  => {
+                nextflow_pipeline_dir     => $self->_pipeline_dir('refseq_import'),
+                nextflow_pipeline_name    => 'refseq_import',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->_outdir('refseq_import'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
+                    assembly_refseq_accession => $self->o('assembly_refseq_accession'),
+                    assembly_name             => $self->o('assembly_name'),
+                    synonyms_tsv              => $synonyms_tsv,
+                    outdir                    => $self->_outdir('refseq_import'),
+                },
+                nextflow_dataflow_outputs => 0,
+                nextflow_binary           => $self->_nf_binary(),
+            },
+            -rc_name         => 'small_long',
             -max_retry_count => 1,
         },
 
         # ================================================================
-        # Stage 3: Collect all GFF3 outputs; trigger consolidation
+        # Stage 4: Consolidate
+        # Triggered by the semaphore after ALL 9 annotation layers complete.
+        # Recursively scans outdir/**/*.gff3 — each annotation pipeline
+        # publishes its GFF3 under its own subdirectory.  Repeat GFF3s are
+        # NOT published so they won't be included.
         # ================================================================
-        # All annotation layer jobs (including RefseqImport) fan into here.
-        # eHive accumulates all channel-2 outputs from all RunXxx analyses.
-        # When all upstream jobs are done the semaphore releases Consolidate.
-        {
-            -logic_name  => 'CollectLayerOutputs',
-            -module      => 'Bio::EnsEMBL::Hive::RunnableDB::Dummy',
-            -flow_into   => { 1 => '?accu_name=gff3_paths&accu_input_variable=path&accu_address=[]' },
-            -meadow_type => 'LOCAL',
-        },
-
         {
             -logic_name  => 'RunConsolidate',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
             -parameters  => {
-                nextflow_pipeline_dir  => $self->_pipeline_dir('consolidate'),
-                nextflow_pipeline_name => 'consolidate',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->_outdir('consolidate'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => {
-                    gff3_files => '#gff3_paths#',
-                    outdir     => $self->_outdir('consolidate'),
+                nextflow_pipeline_dir     => $self->_pipeline_dir('consolidate'),
+                nextflow_pipeline_name    => 'consolidate',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->_outdir('consolidate'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
+                    gff3_dir => $self->o('outdir'),
+                    outdir   => $self->_outdir('consolidate'),
                 },
                 nextflow_dataflow_outputs => 1,
-                nextflow_binary => $self->_nf_binary(),
+                nextflow_binary           => $self->_nf_binary(),
             },
             -rc_name         => 'medium_long',
             -flow_into       => { 2 => 'ConsumeConsolidatedOutput' },
@@ -496,7 +519,7 @@ sub pipeline_analyses {
         },
 
         # ================================================================
-        # Stage 4: Final consumer (replace with DB loading analysis)
+        # Stage 5: Final consumer (replace with DB loading analysis)
         # ================================================================
         {
             -logic_name  => 'ConsumeConsolidatedOutput',
