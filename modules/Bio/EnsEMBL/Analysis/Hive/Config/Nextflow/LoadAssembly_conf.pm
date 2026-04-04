@@ -14,24 +14,32 @@ Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::LoadAssembly_conf
 
 =head1 DESCRIPTION
 
-Minimal eHive pipeline that downloads and prepares a genome assembly from
-NCBI using the Nextflow load_assembly pipeline, then dataflows the output
-file paths to a downstream analysis.
+eHive pipeline that downloads and prepares a genome assembly from NCBI using
+the Nextflow load_assembly pipeline, then dataflows output file paths to a
+downstream analysis.
 
-Designed for local testing without a core database.  A downstream
-StoreAssemblyOutputs analysis is a stub that prints the manifest outputs
-to confirm the dataflow contract works end-to-end.
-
-Usage:
+Usage (HPC production):
 
   init_pipeline.pl Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::LoadAssembly_conf \
-    -pipeline_db    "-host localhost -port 3306 -user ensrw -pass XXX -dbname load_assembly_pipe" \
+    -pipeline_db    "-host mysql-ens-genebuild-prod -port 4527 -user ensrw -pass XXX -dbname jack_load_assembly_human" \
     -assembly_accession GCA_000001405.29 \
     -assembly_name      GRCh38.p14 \
-    -outdir             /data/output/grch38 \
-    -nextflow_work_root /data/nf_work \
-    -nextflow_bin       /usr/local/bin/nextflow \
-    -nf_pipeline_dir    /path/to/ensembl-genes-nf/pipelines/load_assembly
+    -outdir             /hps/scratch/flicek/ensembl/genebuild/grch38/load_assembly \
+    -nextflow_work_root /hps/scratch/flicek/ensembl/genebuild/grch38/nf_work \
+    -nf_pipeline_dir    /nfs/production/flicek/ensembl/genebuild/ensembl-genes-nf/pipelines/load_assembly
+
+Usage (local testing — SQLite, conda profile):
+
+  init_pipeline.pl Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::LoadAssembly_conf \
+    -pipeline_url   sqlite:////tmp/load_assembly.db \
+    -assembly_accession GCA_000001405.29 \
+    -assembly_name      GRCh38.p14 \
+    -outdir             /tmp/load_assembly_out \
+    -nextflow_work_root /tmp/nf_work \
+    -nf_pipeline_dir    ~/projects/ensembl-genes-nf/pipelines/load_assembly \
+    -nextflow_bin       ~/.local/bin/nextflow \
+    -nextflow_profile   conda \
+    -java_home          /opt/homebrew/Cellar/openjdk@21/21.0.10/libexec/openjdk.jdk/Contents/Home
 
 =cut
 
@@ -40,7 +48,7 @@ package Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::LoadAssembly_conf;
 use strict;
 use warnings;
 
-use parent ('Bio::EnsEMBL::Hive::PipeConfig::HiveGeneric_conf');
+use parent ('Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::NfPipelineBase_conf');
 
 
 sub default_options {
@@ -48,28 +56,8 @@ sub default_options {
     return {
         %{ $self->SUPER::default_options() },
 
-        # ----------------------------------------------------------------
-        # Assembly identity — set on command line
-        # ----------------------------------------------------------------
         assembly_accession  => undef,   # e.g. GCA_000001405.29
         assembly_name       => undef,   # e.g. GRCh38.p14
-
-        # ----------------------------------------------------------------
-        # Paths — set on command line
-        # ----------------------------------------------------------------
-        outdir              => undef,   # root output dir written by Nextflow
-        nextflow_work_root  => undef,   # eHive-managed Nextflow work dirs
-        nf_pipeline_dir     => undef,   # path to pipelines/load_assembly/
-
-        # ----------------------------------------------------------------
-        # Nextflow config
-        # ----------------------------------------------------------------
-        nextflow_bin        => 'nextflow',
-        nextflow_profile    => 'local',   # 'slurm' on HPC
-
-        # Java ≥17 is required by Nextflow ≥23.  The system default may be
-        # older; override here if needed.
-        java_home           => '/opt/homebrew/Cellar/openjdk@21/21.0.10/libexec/openjdk.jdk/Contents/Home',
     };
 }
 
@@ -88,9 +76,6 @@ sub pipeline_analyses {
 
     return [
 
-        # ----------------------------------------------------------------
-        # 1. Seed — a single factory job to kick things off
-        # ----------------------------------------------------------------
         {
             -logic_name  => 'SeedAssembly',
             -module      => 'Bio::EnsEMBL::Hive::RunnableDB::JobFactory',
@@ -103,9 +88,6 @@ sub pipeline_analyses {
             -meadow_type => 'LOCAL',
         },
 
-        # ----------------------------------------------------------------
-        # 2. Run Nextflow load_assembly pipeline
-        # ----------------------------------------------------------------
         {
             -logic_name  => 'RunLoadAssembly',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
@@ -122,48 +104,23 @@ sub pipeline_analyses {
                     outdir             => $self->o('outdir'),
                 },
                 nextflow_dataflow_outputs => 1,
-                # Prefix JAVA_HOME so Nextflow picks up the correct JVM.
-                # HiveRunNextflow uses nextflow_binary as the first shell token.
-                nextflow_binary => 'JAVA_HOME=' . $self->o('java_home')
-                    . ' PATH=' . $self->o('java_home') . '/bin:$PATH '
-                    . $self->o('nextflow_bin'),
-                nextflow_extra_flags => ['-stub'],
+                nextflow_binary           => $self->_nf_binary(),
             },
-            -rc_name     => 'small_long',   # small RAM, long wall time
-            -flow_into   => { 2 => 'ConsumeAssemblyOutput' },
+            -rc_name         => 'small_long',
+            -flow_into       => { 2 => 'ConsumeAssemblyOutput' },
             -max_retry_count => 1,
         },
 
-        # ----------------------------------------------------------------
-        # 3. Downstream stub — receives each output from output_manifest.json
-        #    on channel 2.  Replace with real loading logic.
-        # ----------------------------------------------------------------
         {
             -logic_name  => 'ConsumeAssemblyOutput',
             -module      => 'Bio::EnsEMBL::Hive::RunnableDB::SystemCmd',
             -parameters  => {
-                # Each output has: type, path, (optional) meta
                 cmd => 'echo "Assembly output ready: type=#type# path=#path#"',
             },
             -meadow_type => 'LOCAL',
         },
 
     ];
-}
-
-
-sub resource_classes {
-    my ($self) = @_;
-    return {
-        %{ $self->SUPER::resource_classes() },
-        # Launcher job: tiny RAM, but must outlast the full Nextflow run
-        # Format: meadow_type => submission_cmd_args  (scalar or [submit, worker])
-        'small_long' => {
-            'LOCAL' => '',
-            'LSF'   => '-q normal -M 500 -R "select[mem>500] rusage[mem=500]"',
-            'SLURM' => '--partition=long --mem=500M --time=24:00:00',
-        },
-    };
 }
 
 

@@ -40,26 +40,29 @@ All Nextflow subpipelines are launched by HiveRunNextflow.  Each pipeline
 writes output_manifest.json; dataflow on channel 2 passes file paths to the
 next stage.
 
-Usage:
+Usage (HPC production — MySQL + SLURM + Singularity):
 
   init_pipeline.pl Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::FullAnnotation_conf \
-    -pipeline_db               "-host localhost -port 3306 -user ensrw -pass XXX -dbname full_annotation" \
+    -pipeline_db               "-host mysql-ens-genebuild-prod -port 4527 -user ensrw -pass XXX -dbname jack_grch38_annotation" \
     -assembly_accession        GCA_000001405.29 \
     -assembly_name             GRCh38.p14 \
     -assembly_refseq_accession GCF_000001405.40 \
-    -sample_sheet              /data/rnaseq/samples.csv \
-    -cdna_fasta                /data/sequences/cdna.fa \
-    -protein_fasta             /data/sequences/proteins.fa \
-    -uniprot_fasta             /data/proteins/mammals_basic.fa \
-    -igtr_proteins             /data/imgt/imgt_proteins.fa \
-    -long_read_sample_sheet    /data/isoseq/samples.tsv \
-    -protein_db                /data/uniprot/uniprot_db \
-    -rfam_cm                   /data/rfam/Rfam.cm \
-    -source_fasta              /data/source_genome/genome_softmasked.fa \
-    -source_gff3               /data/source_genome/annotation.gff3 \
-    -outdir                    /data/output/grch38 \
-    -nextflow_work_root        /data/nf_work \
-    -nf_base_dir               /path/to/ensembl-genes-nf/pipelines
+    -sample_sheet              /hps/nobackup/.../rnaseq/samples.csv \
+    -cdna_fasta                /hps/nobackup/.../sequences/cdna.fa \
+    -protein_fasta             /hps/nobackup/.../sequences/proteins.fa \
+    -uniprot_fasta             /hps/nobackup/.../proteins/mammals_basic.fa \
+    -igtr_proteins             /hps/nobackup/.../imgt/imgt_proteins.fa \
+    -long_read_sample_sheet    /hps/nobackup/.../isoseq/samples.tsv \
+    -protein_db                /hps/nobackup/.../uniprot/uniprot_db \
+    -rfam_cm                   /hps/nobackup/.../rfam/Rfam.cm \
+    -source_fasta              /hps/nobackup/.../source_genome/genome_softmasked.fa \
+    -source_gff3               /hps/nobackup/.../source_genome/annotation.gff3 \
+    -outdir                    /hps/scratch/flicek/ensembl/genebuild/grch38 \
+    -nextflow_work_root        /hps/scratch/flicek/ensembl/genebuild/grch38/nf_work \
+    -nf_base_dir               /nfs/production/flicek/ensembl/genebuild/ensembl-genes-nf/pipelines
+
+  # Then run workers — eHive manages SLURM submission for Nextflow launcher jobs:
+  beekeeper.pl -url "$EHIVE_URL" -loop
 
 =cut
 
@@ -69,7 +72,7 @@ use strict;
 use warnings;
 use File::Spec::Functions qw(catdir catfile);
 
-use parent ('Bio::EnsEMBL::Hive::PipeConfig::HiveGeneric_conf');
+use parent ('Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::NfPipelineBase_conf');
 
 
 sub default_options {
@@ -99,18 +102,10 @@ sub default_options {
         source_gff3                 => undef,   # source annotation (projection)
 
         # ----------------------------------------------------------------
-        # Output root
+        # Nextflow infrastructure (nf_pipeline_dir from base is unused here;
+        # nf_base_dir is the parent of all pipelines/ subdirs)
         # ----------------------------------------------------------------
-        outdir                      => undef,
-
-        # ----------------------------------------------------------------
-        # Nextflow infrastructure
-        # ----------------------------------------------------------------
-        nextflow_work_root          => undef,
-        nf_base_dir                 => undef,   # parent of all pipelines/ dirs
-        nextflow_bin                => 'nextflow',
-        nextflow_profile            => 'local',
-        java_home                   => '/opt/homebrew/Cellar/openjdk@21/21.0.10/libexec/openjdk.jdk/Contents/Home',
+        nf_base_dir                 => undef,   # e.g. /nfs/production/.../ensembl-genes-nf/pipelines
 
         # ----------------------------------------------------------------
         # Repeat masking options
@@ -130,14 +125,6 @@ sub pipeline_wide_parameters {
     };
 }
 
-
-# Shared JAVA_HOME prefix — used by every HiveRunNextflow analysis
-sub _nf_binary {
-    my ($self) = @_;
-    return 'JAVA_HOME=' . $self->o('java_home')
-        . ' PATH=' . $self->o('java_home') . '/bin:$PATH '
-        . $self->o('nextflow_bin');
-}
 
 # Resolve a pipeline directory under nf_base_dir
 sub _pipeline_dir {
@@ -521,29 +508,6 @@ sub pipeline_analyses {
         },
 
     ];
-}
-
-
-sub resource_classes {
-    my ($self) = @_;
-    return {
-        %{ $self->SUPER::resource_classes() },
-        'small_long' => {
-            'LOCAL' => '',
-            'LSF'   => '-q normal -M 500 -R "select[mem>500] rusage[mem=500]"',
-            'SLURM' => '--partition=long --mem=500M --time=24:00:00',
-        },
-        'medium_long' => {
-            'LOCAL' => '',
-            'LSF'   => '-q normal -M 2000 -R "select[mem>2000] rusage[mem=2000]"',
-            'SLURM' => '--partition=long --mem=2G --time=48:00:00',
-        },
-        'large_long' => {
-            'LOCAL' => '',
-            'LSF'   => '-q normal -M 25000 -R "select[mem>25000] rusage[mem=25000]"',
-            'SLURM' => '--partition=long --mem=25G --time=120:00:00',
-        },
-    };
 }
 
 

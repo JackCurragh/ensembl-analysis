@@ -18,17 +18,6 @@ eHive pipeline that runs the Nextflow long_read pipeline (minimap2 alignment,
 transcript collapse, UniProt-based classification) and dataflows output paths
 on channel 2.
 
-Usage:
-
-  init_pipeline.pl Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::LongRead_conf \
-    -pipeline_db    "-host localhost -port 3306 -user ensrw -pass XXX -dbname long_read_pipe" \
-    -sample_sheet   /data/samples.tsv \
-    -genome_fasta   /data/genome/genome.fa \
-    -protein_db     /data/uniprot/uniprot_db \
-    -outdir         /data/output/long_read \
-    -nextflow_work_root /data/nf_work \
-    -nf_pipeline_dir    /path/to/ensembl-genes-nf/pipelines/long_read
-
 =cut
 
 package Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::LongRead_conf;
@@ -36,7 +25,7 @@ package Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::LongRead_conf;
 use strict;
 use warnings;
 
-use parent ('Bio::EnsEMBL::Hive::PipeConfig::HiveGeneric_conf');
+use parent ('Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::NfPipelineBase_conf');
 
 
 sub default_options {
@@ -44,31 +33,10 @@ sub default_options {
     return {
         %{ $self->SUPER::default_options() },
 
-        # ----------------------------------------------------------------
-        # Required inputs
-        # ----------------------------------------------------------------
-        sample_sheet        => undef,   # TSV: id, fastq path, (optional) platform
-        genome_fasta        => undef,   # genome FASTA
-        protein_db          => undef,   # UniProt BLAST DB path
-
-        # ----------------------------------------------------------------
-        # Optional inputs
-        # ----------------------------------------------------------------
-        genome_index        => undef,   # pre-built minimap2 index (skips indexing)
-
-        # ----------------------------------------------------------------
-        # Paths
-        # ----------------------------------------------------------------
-        outdir              => undef,
-        nextflow_work_root  => undef,
-        nf_pipeline_dir     => undef,
-
-        # ----------------------------------------------------------------
-        # Nextflow config
-        # ----------------------------------------------------------------
-        nextflow_bin        => 'nextflow',
-        nextflow_profile    => 'local',
-        java_home           => '/opt/homebrew/Cellar/openjdk@21/21.0.10/libexec/openjdk.jdk/Contents/Home',
+        sample_sheet    => undef,   # TSV: id, fastq path, (optional) platform
+        genome_fasta    => undef,   # genome FASTA
+        protein_db      => undef,   # UniProt BLAST DB path
+        genome_index    => undef,   # pre-built minimap2 index (optional)
     };
 }
 
@@ -91,9 +59,7 @@ sub pipeline_analyses {
         protein_db   => $self->o('protein_db'),
         outdir       => $self->o('outdir'),
     );
-    if (defined $self->o('genome_index')) {
-        $nf_params{genome_index} = $self->o('genome_index');
-    }
+    $nf_params{genome_index} = $self->o('genome_index') if defined $self->o('genome_index');
 
     return [
 
@@ -109,47 +75,29 @@ sub pipeline_analyses {
             -logic_name  => 'RunLongRead',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
             -parameters  => {
-                nextflow_pipeline_dir  => $self->o('nf_pipeline_dir'),
-                nextflow_pipeline_name => 'long_read',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->o('outdir'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => \%nf_params,
+                nextflow_pipeline_dir     => $self->o('nf_pipeline_dir'),
+                nextflow_pipeline_name    => 'long_read',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->o('outdir'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => \%nf_params,
                 nextflow_dataflow_outputs => 1,
-                nextflow_binary => 'JAVA_HOME=' . $self->o('java_home')
-                    . ' PATH=' . $self->o('java_home') . '/bin:$PATH '
-                    . $self->o('nextflow_bin'),
+                nextflow_binary           => $self->_nf_binary(),
             },
-            -rc_name     => 'large_long',
-            -flow_into   => { 2 => 'ConsumeLongReadOutput' },
+            -rc_name         => 'large_long',
+            -flow_into       => { 2 => 'ConsumeLongReadOutput' },
             -max_retry_count => 1,
         },
 
         {
             -logic_name  => 'ConsumeLongReadOutput',
             -module      => 'Bio::EnsEMBL::Hive::RunnableDB::SystemCmd',
-            -parameters  => {
-                cmd => 'echo "LongRead output ready: type=#type# path=#path#"',
-            },
+            -parameters  => { cmd => 'echo "LongRead output ready: type=#type# path=#path#"' },
             -meadow_type => 'LOCAL',
         },
 
     ];
-}
-
-
-sub resource_classes {
-    my ($self) = @_;
-    return {
-        %{ $self->SUPER::resource_classes() },
-        # Minimap2 index requires ~20 GB RAM; long wall time for large datasets
-        'large_long' => {
-            'LOCAL' => '',
-            'LSF'   => '-q normal -M 25000 -R "select[mem>25000] rusage[mem=25000]"',
-            'SLURM' => '--partition=long --mem=25G --time=72:00:00',
-        },
-    };
 }
 
 

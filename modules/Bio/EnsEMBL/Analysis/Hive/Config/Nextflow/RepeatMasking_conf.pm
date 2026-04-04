@@ -18,15 +18,6 @@ eHive pipeline that runs the Nextflow repeat_masking pipeline (RepeatMasker,
 RED, TRF, DUST masking → softmasked genome FASTA) and dataflows output paths
 on channel 2.
 
-Usage:
-
-  init_pipeline.pl Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::RepeatMasking_conf \
-    -pipeline_db    "-host localhost -port 3306 -user ensrw -pass XXX -dbname repeat_pipe" \
-    -genome_fasta   /data/genome/genome.fa \
-    -outdir         /data/output/repeat_masking \
-    -nextflow_work_root /data/nf_work \
-    -nf_pipeline_dir    /path/to/ensembl-genes-nf/pipelines/repeat_masking
-
 =cut
 
 package Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::RepeatMasking_conf;
@@ -34,7 +25,7 @@ package Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::RepeatMasking_conf;
 use strict;
 use warnings;
 
-use parent ('Bio::EnsEMBL::Hive::PipeConfig::HiveGeneric_conf');
+use parent ('Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::NfPipelineBase_conf');
 
 
 sub default_options {
@@ -42,39 +33,14 @@ sub default_options {
     return {
         %{ $self->SUPER::default_options() },
 
-        # ----------------------------------------------------------------
-        # Required inputs
-        # ----------------------------------------------------------------
-        genome_fasta        => undef,   # genome FASTA (raw / unmasked)
-
-        # ----------------------------------------------------------------
-        # Optional inputs
-        # ----------------------------------------------------------------
-        repbase_library     => undef,   # RepBase library (.h5)
-        custom_library      => undef,   # custom repeat library FASTA
-        species             => 'mammals',  # RepeatMasker species clade
-
-        # ----------------------------------------------------------------
-        # Masking steps to skip (booleans)
-        # ----------------------------------------------------------------
-        skip_repeatmodeler  => 1,   # RepeatModeler is slow; off by default
+        genome_fasta        => undef,       # raw / unmasked genome FASTA
+        repbase_library     => undef,       # RepBase library .h5 (optional)
+        custom_library      => undef,       # custom repeat library FASTA (optional)
+        repeat_species      => 'mammals',   # RepeatMasker species clade
+        skip_repeatmodeler  => 1,           # RepeatModeler is slow; off by default
         skip_red            => 0,
         skip_trf            => 0,
         skip_dust           => 0,
-
-        # ----------------------------------------------------------------
-        # Paths
-        # ----------------------------------------------------------------
-        outdir              => undef,
-        nextflow_work_root  => undef,
-        nf_pipeline_dir     => undef,
-
-        # ----------------------------------------------------------------
-        # Nextflow config
-        # ----------------------------------------------------------------
-        nextflow_bin        => 'nextflow',
-        nextflow_profile    => 'local',
-        java_home           => '/opt/homebrew/Cellar/openjdk@21/21.0.10/libexec/openjdk.jdk/Contents/Home',
     };
 }
 
@@ -93,19 +59,15 @@ sub pipeline_analyses {
 
     my %nf_params = (
         genome_fasta       => $self->o('genome_fasta'),
-        species            => $self->o('species'),
+        species            => $self->o('repeat_species'),
         skip_repeatmodeler => $self->o('skip_repeatmodeler'),
         skip_red           => $self->o('skip_red'),
         skip_trf           => $self->o('skip_trf'),
         skip_dust          => $self->o('skip_dust'),
         outdir             => $self->o('outdir'),
     );
-    if (defined $self->o('repbase_library')) {
-        $nf_params{repbase_library} = $self->o('repbase_library');
-    }
-    if (defined $self->o('custom_library')) {
-        $nf_params{custom_library} = $self->o('custom_library');
-    }
+    $nf_params{repbase_library}  = $self->o('repbase_library')  if defined $self->o('repbase_library');
+    $nf_params{custom_library}   = $self->o('custom_library')   if defined $self->o('custom_library');
 
     return [
 
@@ -121,47 +83,29 @@ sub pipeline_analyses {
             -logic_name  => 'RunRepeatMasking',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
             -parameters  => {
-                nextflow_pipeline_dir  => $self->o('nf_pipeline_dir'),
-                nextflow_pipeline_name => 'repeat_masking',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->o('outdir'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => \%nf_params,
+                nextflow_pipeline_dir     => $self->o('nf_pipeline_dir'),
+                nextflow_pipeline_name    => 'repeat_masking',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->o('outdir'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => \%nf_params,
                 nextflow_dataflow_outputs => 1,
-                nextflow_binary => 'JAVA_HOME=' . $self->o('java_home')
-                    . ' PATH=' . $self->o('java_home') . '/bin:$PATH '
-                    . $self->o('nextflow_bin'),
+                nextflow_binary           => $self->_nf_binary(),
             },
-            -rc_name     => 'large_long',
-            -flow_into   => { 2 => 'ConsumeRepeatMaskingOutput' },
+            -rc_name         => 'large_long',
+            -flow_into       => { 2 => 'ConsumeRepeatMaskingOutput' },
             -max_retry_count => 1,
         },
 
         {
             -logic_name  => 'ConsumeRepeatMaskingOutput',
             -module      => 'Bio::EnsEMBL::Hive::RunnableDB::SystemCmd',
-            -parameters  => {
-                cmd => 'echo "RepeatMasking output ready: type=#type# path=#path#"',
-            },
+            -parameters  => { cmd => 'echo "RepeatMasking output ready: type=#type# path=#path#"' },
             -meadow_type => 'LOCAL',
         },
 
     ];
-}
-
-
-sub resource_classes {
-    my ($self) = @_;
-    return {
-        %{ $self->SUPER::resource_classes() },
-        # RepeatMasker on large genomes needs substantial RAM and can run for days
-        'large_long' => {
-            'LOCAL' => '',
-            'LSF'   => '-q normal -M 8000 -R "select[mem>8000] rusage[mem=8000]"',
-            'SLURM' => '--partition=long --mem=8G --time=120:00:00',
-        },
-    };
 }
 
 

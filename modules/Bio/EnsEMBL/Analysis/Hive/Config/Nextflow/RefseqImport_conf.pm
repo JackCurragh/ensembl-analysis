@@ -18,16 +18,6 @@ eHive pipeline that runs the Nextflow refseq_import pipeline (downloads and
 parses RefSeq annotation for a given assembly) and dataflows output paths on
 channel 2.
 
-Usage:
-
-  init_pipeline.pl Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::RefseqImport_conf \
-    -pipeline_db               "-host localhost -port 3306 -user ensrw -pass XXX -dbname refseq_pipe" \
-    -assembly_refseq_accession GCF_000001405.40 \
-    -assembly_name             GRCh38.p14 \
-    -outdir                    /data/output/refseq \
-    -nextflow_work_root        /data/nf_work \
-    -nf_pipeline_dir           /path/to/ensembl-genes-nf/pipelines/refseq_import
-
 =cut
 
 package Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::RefseqImport_conf;
@@ -35,7 +25,7 @@ package Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::RefseqImport_conf;
 use strict;
 use warnings;
 
-use parent ('Bio::EnsEMBL::Hive::PipeConfig::HiveGeneric_conf');
+use parent ('Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::NfPipelineBase_conf');
 
 
 sub default_options {
@@ -43,31 +33,10 @@ sub default_options {
     return {
         %{ $self->SUPER::default_options() },
 
-        # ----------------------------------------------------------------
-        # Required inputs
-        # ----------------------------------------------------------------
-        assembly_refseq_accession => undef,   # e.g. GCF_000001405.40
-        assembly_name             => undef,   # e.g. GRCh38.p14
-
-        # ----------------------------------------------------------------
-        # Optional inputs
-        # ----------------------------------------------------------------
-        synonyms_tsv              => undef,   # RefSeq accession → chr name TSV
-        keep_patches              => 0,       # include NT_/NW_ scaffold sequences
-
-        # ----------------------------------------------------------------
-        # Paths
-        # ----------------------------------------------------------------
-        outdir              => undef,
-        nextflow_work_root  => undef,
-        nf_pipeline_dir     => undef,
-
-        # ----------------------------------------------------------------
-        # Nextflow config
-        # ----------------------------------------------------------------
-        nextflow_bin        => 'nextflow',
-        nextflow_profile    => 'local',
-        java_home           => '/opt/homebrew/Cellar/openjdk@21/21.0.10/libexec/openjdk.jdk/Contents/Home',
+        assembly_refseq_accession   => undef,   # e.g. GCF_000001405.40
+        assembly_name               => undef,   # e.g. GRCh38.p14
+        synonyms_tsv                => undef,   # RefSeq accession → chr name TSV (optional)
+        keep_patches                => 0,       # include NT_/NW_ scaffold sequences
     };
 }
 
@@ -90,9 +59,7 @@ sub pipeline_analyses {
         keep_patches              => $self->o('keep_patches'),
         outdir                    => $self->o('outdir'),
     );
-    if (defined $self->o('synonyms_tsv')) {
-        $nf_params{synonyms_tsv} = $self->o('synonyms_tsv');
-    }
+    $nf_params{synonyms_tsv} = $self->o('synonyms_tsv') if defined $self->o('synonyms_tsv');
 
     return [
 
@@ -108,46 +75,29 @@ sub pipeline_analyses {
             -logic_name  => 'RunRefseqImport',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
             -parameters  => {
-                nextflow_pipeline_dir  => $self->o('nf_pipeline_dir'),
-                nextflow_pipeline_name => 'refseq_import',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->o('outdir'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => \%nf_params,
+                nextflow_pipeline_dir     => $self->o('nf_pipeline_dir'),
+                nextflow_pipeline_name    => 'refseq_import',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->o('outdir'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => \%nf_params,
                 nextflow_dataflow_outputs => 1,
-                nextflow_binary => 'JAVA_HOME=' . $self->o('java_home')
-                    . ' PATH=' . $self->o('java_home') . '/bin:$PATH '
-                    . $self->o('nextflow_bin'),
+                nextflow_binary           => $self->_nf_binary(),
             },
-            -rc_name     => 'small_long',
-            -flow_into   => { 2 => 'ConsumeRefseqImportOutput' },
+            -rc_name         => 'small_long',
+            -flow_into       => { 2 => 'ConsumeRefseqImportOutput' },
             -max_retry_count => 1,
         },
 
         {
             -logic_name  => 'ConsumeRefseqImportOutput',
             -module      => 'Bio::EnsEMBL::Hive::RunnableDB::SystemCmd',
-            -parameters  => {
-                cmd => 'echo "RefseqImport output ready: type=#type# path=#path#"',
-            },
+            -parameters  => { cmd => 'echo "RefseqImport output ready: type=#type# path=#path#"' },
             -meadow_type => 'LOCAL',
         },
 
     ];
-}
-
-
-sub resource_classes {
-    my ($self) = @_;
-    return {
-        %{ $self->SUPER::resource_classes() },
-        'small_long' => {
-            'LOCAL' => '',
-            'LSF'   => '-q normal -M 500 -R "select[mem>500] rusage[mem=500]"',
-            'SLURM' => '--partition=long --mem=500M --time=24:00:00',
-        },
-    };
 }
 
 

@@ -18,16 +18,6 @@ eHive pipeline that runs the Nextflow igtr pipeline (Immunoglobulin and
 T-cell Receptor gene annotation via GenBlast protein homology) and dataflows
 output paths on channel 2.
 
-Usage:
-
-  init_pipeline.pl Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::Igtr_conf \
-    -pipeline_db    "-host localhost -port 3306 -user ensrw -pass XXX -dbname igtr_pipe" \
-    -genome_fasta   /data/genome/genome_softmasked.fa \
-    -igtr_proteins  /data/imgt/imgt_proteins.fa \
-    -outdir         /data/output/igtr \
-    -nextflow_work_root /data/nf_work \
-    -nf_pipeline_dir    /path/to/ensembl-genes-nf/pipelines/igtr
-
 =cut
 
 package Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::Igtr_conf;
@@ -35,7 +25,7 @@ package Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::Igtr_conf;
 use strict;
 use warnings;
 
-use parent ('Bio::EnsEMBL::Hive::PipeConfig::HiveGeneric_conf');
+use parent ('Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::NfPipelineBase_conf');
 
 
 sub default_options {
@@ -43,25 +33,8 @@ sub default_options {
     return {
         %{ $self->SUPER::default_options() },
 
-        # ----------------------------------------------------------------
-        # Required inputs
-        # ----------------------------------------------------------------
-        genome_fasta        => undef,   # softmasked genome FASTA
-        igtr_proteins       => undef,   # IMGT IG/TR protein FASTA
-
-        # ----------------------------------------------------------------
-        # Paths
-        # ----------------------------------------------------------------
-        outdir              => undef,
-        nextflow_work_root  => undef,
-        nf_pipeline_dir     => undef,
-
-        # ----------------------------------------------------------------
-        # Nextflow config
-        # ----------------------------------------------------------------
-        nextflow_bin        => 'nextflow',
-        nextflow_profile    => 'local',
-        java_home           => '/opt/homebrew/Cellar/openjdk@21/21.0.10/libexec/openjdk.jdk/Contents/Home',
+        genome_fasta    => undef,   # softmasked genome FASTA
+        igtr_proteins   => undef,   # IMGT IG/TR protein FASTA
     };
 }
 
@@ -92,50 +65,33 @@ sub pipeline_analyses {
             -logic_name  => 'RunIgtr',
             -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
             -parameters  => {
-                nextflow_pipeline_dir  => $self->o('nf_pipeline_dir'),
-                nextflow_pipeline_name => 'igtr',
-                nextflow_work_root     => $self->o('nextflow_work_root'),
-                nextflow_output_dir    => $self->o('outdir'),
-                nextflow_resume_mode   => 'attempt',
-                nextflow_profile       => $self->o('nextflow_profile'),
-                nextflow_params        => {
-                    genome_fasta   => $self->o('genome_fasta'),
-                    igtr_proteins  => $self->o('igtr_proteins'),
-                    outdir         => $self->o('outdir'),
+                nextflow_pipeline_dir     => $self->o('nf_pipeline_dir'),
+                nextflow_pipeline_name    => 'igtr',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->o('outdir'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
+                    genome_fasta  => $self->o('genome_fasta'),
+                    igtr_proteins => $self->o('igtr_proteins'),
+                    outdir        => $self->o('outdir'),
                 },
                 nextflow_dataflow_outputs => 1,
-                nextflow_binary => 'JAVA_HOME=' . $self->o('java_home')
-                    . ' PATH=' . $self->o('java_home') . '/bin:$PATH '
-                    . $self->o('nextflow_bin'),
+                nextflow_binary           => $self->_nf_binary(),
             },
-            -rc_name     => 'medium_long',
-            -flow_into   => { 2 => 'ConsumeIgtrOutput' },
+            -rc_name         => 'medium_long',
+            -flow_into       => { 2 => 'ConsumeIgtrOutput' },
             -max_retry_count => 1,
         },
 
         {
             -logic_name  => 'ConsumeIgtrOutput',
             -module      => 'Bio::EnsEMBL::Hive::RunnableDB::SystemCmd',
-            -parameters  => {
-                cmd => 'echo "IGTR output ready: type=#type# path=#path#"',
-            },
+            -parameters  => { cmd => 'echo "IGTR output ready: type=#type# path=#path#"' },
             -meadow_type => 'LOCAL',
         },
 
     ];
-}
-
-
-sub resource_classes {
-    my ($self) = @_;
-    return {
-        %{ $self->SUPER::resource_classes() },
-        'medium_long' => {
-            'LOCAL' => '',
-            'LSF'   => '-q normal -M 2000 -R "select[mem>2000] rusage[mem=2000]"',
-            'SLURM' => '--partition=long --mem=2G --time=48:00:00',
-        },
-    };
 }
 
 
