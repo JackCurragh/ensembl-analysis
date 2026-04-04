@@ -60,6 +60,14 @@ sub default_options {
         #   /opt/homebrew/Cellar/openjdk@21/21.0.10/libexec/openjdk.jdk/Contents/Home
         java_home           => '',
 
+        # Extra directories to prepend to PATH before invoking Nextflow.
+        # On macOS with conda profile, set to '/opt/homebrew/bin' so that
+        # Nextflow can find the micromamba binary in its subprocess environment.
+        # Also set MAMBA_ROOT_PREFIX if using micromamba outside a shell session.
+        # Leave empty on HPC (tools are on PATH or provided by Singularity).
+        nextflow_path_extra => '',
+        mamba_root_prefix   => '',   # e.g. /Users/jackt/mamba on macOS
+
         # ----------------------------------------------------------------
         # Paths common to all pipelines
         # ----------------------------------------------------------------
@@ -72,22 +80,35 @@ sub default_options {
 
 =head2 _nf_binary
 
-  Description: Returns the shell token used to invoke Nextflow.
-               If java_home is set, prepends JAVA_HOME= and PATH= assignments
-               so that Nextflow picks up the correct JVM.  Otherwise returns
-               nextflow_bin as-is.
+  Description: Returns the shell token(s) used to invoke Nextflow.
+               Prepends env-var assignments for JAVA_HOME, PATH, and
+               MAMBA_ROOT_PREFIX as configured.  On HPC all of these
+               are typically empty and the method returns just nextflow_bin.
   Returntype : String
 
 =cut
 
 sub _nf_binary {
     my ($self) = @_;
-    my $java_home = $self->o('java_home');
-    my $nf_bin    = $self->o('nextflow_bin');
-    if ($java_home) {
-        return "JAVA_HOME=${java_home} PATH=${java_home}/bin:\$PATH ${nf_bin}";
+    my $java_home         = $self->o('java_home');
+    my $path_extra        = $self->o('nextflow_path_extra');
+    my $mamba_root_prefix = $self->o('mamba_root_prefix');
+    my $nf_bin            = $self->o('nextflow_bin');
+
+    my @env_parts;
+
+    # Build PATH — combine extra dirs with java/bin then fall back to $PATH
+    my @path_dirs;
+    push @path_dirs, $path_extra   if $path_extra;
+    push @path_dirs, "${java_home}/bin" if $java_home;
+    if (@path_dirs) {
+        push @env_parts, 'PATH=' . join(':', @path_dirs, '$PATH');
     }
-    return $nf_bin;
+
+    push @env_parts, "JAVA_HOME=${java_home}"                 if $java_home;
+    push @env_parts, "MAMBA_ROOT_PREFIX=${mamba_root_prefix}" if $mamba_root_prefix;
+
+    return join(' ', @env_parts, $nf_bin);
 }
 
 
