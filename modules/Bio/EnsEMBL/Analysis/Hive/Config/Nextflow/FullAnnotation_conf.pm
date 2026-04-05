@@ -16,6 +16,11 @@ Bio::EnsEMBL::Analysis::Hive::Config::Nextflow::FullAnnotation_conf
 
 End-to-end genome annotation eHive pipeline using the Nextflow subpipelines.
 
+PipeConfigs used by this pipeline:
+  - NfPipelineBase_conf        (base class)
+  - UtrAddition_conf           (stage 5 — standalone equivalent)
+  - FinaliseGeneset_conf       (stage 6 — standalone equivalent)
+
 Dependency graph:
 
   Seed
@@ -41,15 +46,24 @@ Dependency graph:
    │ A->1 (triggered when ALL 9 annotation layers complete)       │
    ▼ ◄─────────────────────────────────────────────────────────────┘
   RunConsolidate            (scans outdir/**/*.gff3 for all GFF3s)
-   │ channel 2
+   │ channel 2 (#path# = consolidated GFF3)
    ▼
-  ConsumeConsolidatedOutput
+  RunUtrAddition            (extends UTRs using long-read/cDNA/RNA-seq donors)
+   │ channel 2 (#path# = UTR-extended GFF3)
+   ▼
+  RunFinaliseGeneset        (filters by repeat coverage, ORF, intron size etc.)
+   │ channel 2 (#path# = final geneset GFF3)
+   ▼
+  ConsumeFinalGeneset
 
-All input paths (genome_fasta, softmasked_fasta, synonyms_tsv) are computed
-from the assembly_accession + assembly_name at init time using the known
-publishDir conventions of each Nextflow pipeline.  This avoids relying on
-eHive channel-2 dataflow for sequential path-passing, which would require
-per-output type filtering.
+All input paths (genome_fasta, softmasked_fasta, synonyms_tsv, repeat_gff3)
+are computed from the assembly_accession + assembly_name at init time using
+the known publishDir conventions of each Nextflow pipeline.  This avoids
+relying on eHive channel-2 dataflow for sequential path-passing beyond the
+points where dataflow is explicitly used (stages 4-6).
+
+NOTE: RunFinaliseGeneset requires MERGE_REPEATS in the repeat_masking pipeline
+to publish its *.repeats.gff3 to outdir/repeats/ (see TODO in pipeline body).
 
 Usage (HPC production — MySQL + SLURM + Singularity):
 
@@ -514,18 +528,91 @@ sub pipeline_analyses {
                 nextflow_binary           => $self->_nf_binary(),
             },
             -rc_name         => 'medium_long',
-            -flow_into       => { 2 => 'ConsumeConsolidatedOutput' },
+            -flow_into       => { 2 => 'RunUtrAddition' },
             -max_retry_count => 1,
         },
 
         # ================================================================
-        # Stage 5: Final consumer (replace with DB loading analysis)
+        # Stage 5: UTR addition
+        # Receives consolidated GFF3 via channel-2 dataflow (#path#) from
+        # RunConsolidate.  Donor GFF3 files are passed as comma-separated
+        # glob patterns covering the per-pipeline output subdirectories;
+        # the utr_addition main.nf uses Channel.fromPath with these patterns.
         # ================================================================
         {
-            -logic_name  => 'ConsumeConsolidatedOutput',
+            -logic_name  => 'RunUtrAddition',
+            -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
+            -parameters  => {
+                nextflow_pipeline_dir     => $self->_pipeline_dir('utr_addition'),
+                nextflow_pipeline_name    => 'utr_addition',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->_outdir('utr_addition'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
+                    consolidated_gff3 => '#path#',
+                    # Comma-separated glob patterns — utr_addition/main.nf splits on
+                    # comma and feeds each pattern to Channel.fromPath(glob: true).
+                    donor_gff3_files  => join(',',
+                        catfile($self->_outdir('long_read'),         '**', '*.gff3'),
+                        catfile($self->_outdir('best_targeted'),     '**', '*.gff3'),
+                        catfile($self->_outdir('rnaseq'),            '**', '*.gff3'),
+                    ),
+                    outdir            => $self->_outdir('utr_addition'),
+                },
+                nextflow_dataflow_outputs => 1,
+                nextflow_binary           => $self->_nf_binary(),
+            },
+            -rc_name         => 'medium_long',
+            -flow_into       => { 2 => 'RunFinaliseGeneset' },
+            -max_retry_count => 1,
+        },
+
+        # ================================================================
+        # Stage 6: Finalise geneset
+        # Receives UTR-extended GFF3 via channel-2 dataflow (#path#) from
+        # RunUtrAddition.  The repeat GFF3 path is derived from the known
+        # publishDir of MERGE_REPEATS in the repeat_masking pipeline.
+        #
+        # TODO: add publishDir to MERGE_REPEATS in
+        #   ensembl-genes-nf/pipelines/repeat_masking/modules/merge_repeats.nf:
+        #     publishDir "${params.outdir}/repeats", mode: 'copy', pattern: "*.repeats.gff3"
+        # ================================================================
+        {
+            -logic_name  => 'RunFinaliseGeneset',
+            -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
+            -parameters  => {
+                nextflow_pipeline_dir     => $self->_pipeline_dir('finalise_geneset'),
+                nextflow_pipeline_name    => 'finalise_geneset',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->_outdir('finalise_geneset'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
+                    input_gff3  => '#path#',
+                    repeat_gff3 => catfile(
+                        $self->_outdir('repeat_masking'),
+                        'repeats',
+                        $self->o('assembly_accession') . '_' . $self->o('assembly_name') . '_genomic.repeats.gff3',
+                    ),
+                    outdir      => $self->_outdir('finalise_geneset'),
+                },
+                nextflow_dataflow_outputs => 1,
+                nextflow_binary           => $self->_nf_binary(),
+            },
+            -rc_name         => 'medium_long',
+            -flow_into       => { 2 => 'ConsumeFinalGeneset' },
+            -max_retry_count => 1,
+        },
+
+        # ================================================================
+        # Stage 7: Final consumer (replace with DB loading analysis)
+        # ================================================================
+        {
+            -logic_name  => 'ConsumeFinalGeneset',
             -module      => 'Bio::EnsEMBL::Hive::RunnableDB::SystemCmd',
             -parameters  => {
-                cmd => 'echo "Final annotation ready: type=#type# path=#path#"',
+                cmd => 'echo "Final annotated geneset ready: type=#type# path=#path#"',
             },
             -meadow_type => 'LOCAL',
         },
