@@ -54,7 +54,10 @@ Dependency graph:
   RunFinaliseGeneset        (filters by repeat coverage, ORF, intron size etc.)
    │ channel 2 (#path# = final geneset GFF3)
    ▼
-  ConsumeFinalGeneset
+  RunGff3ToCore             (loads GFF3 → Ensembl core DB + assigns stable IDs)
+   │ channel 2
+   ▼
+  ConsumeGff3ToCoreOutput
 
 All input paths (genome_fasta, softmasked_fasta, synonyms_tsv, repeat_gff3)
 are computed from the assembly_accession + assembly_name at init time using
@@ -82,6 +85,14 @@ Usage (HPC production — MySQL + SLURM + Singularity):
     -rfam_cm                   /hps/nobackup/.../rfam/Rfam.cm \
     -source_fasta              /hps/nobackup/.../source_genome/genome_softmasked.fa \
     -source_gff3               /hps/nobackup/.../source_genome/annotation.gff3 \
+    -target_db_host            mysql-ens-genebuild-prod \
+    -target_db_port            4527 \
+    -target_db_user            ensrw \
+    -target_db_password        XXX \
+    -target_db_name            homo_sapiens_core_109_38 \
+    -assembly_version          GRCh38 \
+    -species_name              homo_sapiens \
+    -stable_id_prefix          '' \
     -outdir                    /hps/scratch/flicek/ensembl/genebuild/grch38 \
     -nextflow_work_root        /hps/scratch/flicek/ensembl/genebuild/grch38/nf_work \
     -nf_base_dir               /nfs/production/flicek/ensembl/genebuild/ensembl-genes-nf/pipelines
@@ -138,6 +149,21 @@ sub default_options {
         repbase_library             => undef,
         custom_repeat_library       => undef,
         repeat_species              => 'mammals',
+
+        # ----------------------------------------------------------------
+        # Target Ensembl core database (Stage 7: gff3_to_core loading)
+        # ----------------------------------------------------------------
+        target_db_host              => undef,   # required for stage 7
+        target_db_port              => 3306,
+        target_db_user              => undef,   # needs INSERT/UPDATE on core DB
+        target_db_password          => '',
+        target_db_name              => undef,   # must have core schema pre-loaded
+        assembly_version            => undef,   # e.g. GRCh38 (short assembly name for DB loading)
+        species_name                => '',      # Ensembl production name e.g. homo_sapiens
+        species_id                  => 1,
+        stable_id_prefix            => '',      # '' for human, 'GAL' for chicken etc.
+        coord_system                => 'chromosome',
+        analysis_logic_name         => 'ensembl',
     };
 }
 
@@ -569,7 +595,7 @@ sub pipeline_analyses {
         },
 
         # ================================================================
-        # Stage 6: Finalise geneset
+        # Stage 6: Finalise geneset (uses repeat GFF3 from stage 2)
         # Receives UTR-extended GFF3 via channel-2 dataflow (#path#) from
         # RunUtrAddition.  The repeat GFF3 path is derived from the known
         # publishDir of MERGE_REPEATS in the repeat_masking pipeline.
@@ -601,18 +627,62 @@ sub pipeline_analyses {
                 nextflow_binary           => $self->_nf_binary(),
             },
             -rc_name         => 'medium_long',
-            -flow_into       => { 2 => 'ConsumeFinalGeneset' },
+            -flow_into       => { 2 => 'RunGff3ToCore' },
             -max_retry_count => 1,
         },
 
         # ================================================================
-        # Stage 7: Final consumer (replace with DB loading analysis)
+        # Stage 7: Load final geneset GFF3 into Ensembl core database
+        # and assign stable IDs (ENSG/ENST/ENSE/ENSP).
+        #
+        # Receives the final GFF3 path via channel-2 dataflow (#path#).
+        # The genome .fai and synonyms TSV are derived from known publishDir
+        # conventions of load_assembly (stage 1).
+        #
+        # Prerequisites: target core DB must have schema pre-loaded:
+        #   mysql -u ensrw -p -e "CREATE DATABASE ${target_db_name};"
+        #   mysql -u ensrw -p ${target_db_name} < ensembl-core-schema.sql
         # ================================================================
         {
-            -logic_name  => 'ConsumeFinalGeneset',
+            -logic_name  => 'RunGff3ToCore',
+            -module      => 'Bio::EnsEMBL::Analysis::Hive::RunnableDB::HiveRunNextflow',
+            -parameters  => {
+                nextflow_pipeline_dir     => $self->_pipeline_dir('gff3_to_core'),
+                nextflow_pipeline_name    => 'gff3_to_core',
+                nextflow_work_root        => $self->o('nextflow_work_root'),
+                nextflow_output_dir       => $self->_outdir('gff3_to_core'),
+                nextflow_resume_mode      => 'attempt',
+                nextflow_profile          => $self->o('nextflow_profile'),
+                nextflow_params           => {
+                    input_gff3          => '#path#',
+                    db_host             => $self->o('target_db_host'),
+                    db_port             => $self->o('target_db_port'),
+                    db_user             => $self->o('target_db_user'),
+                    db_password         => $self->o('target_db_password'),
+                    db_name             => $self->o('target_db_name'),
+                    assembly            => $self->o('assembly_version'),
+                    species_name        => $self->o('species_name'),
+                    species_id          => $self->o('species_id'),
+                    stable_id_prefix    => $self->o('stable_id_prefix'),
+                    coord_system        => $self->o('coord_system'),
+                    analysis_logic_name => $self->o('analysis_logic_name'),
+                    genome_fai          => $genome_fasta . '.fai',
+                    synonyms_tsv        => $synonyms_tsv,
+                    outdir              => $self->_outdir('gff3_to_core'),
+                },
+                nextflow_dataflow_outputs => 1,
+                nextflow_binary           => $self->_nf_binary(),
+            },
+            -rc_name         => 'medium_long',
+            -flow_into       => { 2 => 'ConsumeGff3ToCoreOutput' },
+            -max_retry_count => 1,
+        },
+
+        {
+            -logic_name  => 'ConsumeGff3ToCoreOutput',
             -module      => 'Bio::EnsEMBL::Hive::RunnableDB::SystemCmd',
             -parameters  => {
-                cmd => 'echo "Final annotated geneset ready: type=#type# path=#path#"',
+                cmd => 'echo "Core DB loaded: type=#type# db=#path#"',
             },
             -meadow_type => 'LOCAL',
         },
