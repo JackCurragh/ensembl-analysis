@@ -26,6 +26,29 @@ On failure the runnable parses the Nextflow log to extract the actual error
 reason and includes it in the eHive job message, so you don't have to dig
 through the raw log.
 
+=head2 Output manifest and dataflow
+
+After a successful run, if the Nextflow pipeline has written an
+C<output_manifest.json> file to C<--outdir>, C<write_output> reads it and
+fans out one eHive job per output entry on B<channel 2>. Pipelines that do
+not write an output manifest simply flow on channel 1 (the default eHive
+completion channel) with no additional dataflow.
+
+The manifest must conform to the contract defined in the ensembl-genebuild
+ADR 003. Minimum structure:
+
+  {
+    "pipeline":     "riboseq",
+    "version":      "1.0.0",
+    "completed_at": "2026-04-02T12:00:00Z",
+    "outputs": [
+      {"type": "bam", "path": "/abs/path/file.bam", "meta": {"id": "s1"}}
+    ]
+  }
+
+Each element of C<outputs> is dataflowed as-is on channel 2, so downstream
+analyses receive C<type>, C<path>, and C<meta> as their input parameters.
+
 =head2 Resume modes
 
   never   - Always run fresh; -resume is never passed. A new work directory
@@ -64,6 +87,8 @@ through the raw log.
   nextflow_profile       - Nextflow -profile value, e.g. 'slurm,singularity'
   nextflow_params        - Hashref of --param => value pairs for the pipeline
   nextflow_extra_flags   - Arrayref of extra CLI flags passed verbatim
+  nextflow_dataflow_outputs - Boolean; if true (default), read output_manifest.json
+                              from --outdir and dataflow each output on channel 2
 
 =cut
 
@@ -75,6 +100,7 @@ use feature 'say';
 
 use File::Path qw(make_path);
 use File::Spec::Functions qw(catdir catfile);
+use JSON qw(decode_json);
 use POSIX qw(strftime);
 
 use base ('Bio::EnsEMBL::Hive::Process');
@@ -82,12 +108,13 @@ use base ('Bio::EnsEMBL::Hive::Process');
 
 sub param_defaults {
     return {
-        nextflow_binary       => 'nextflow',
-        nextflow_resume_mode  => 'attempt',   # never | attempt | job
-        nextflow_profile      => undef,
-        nextflow_params       => {},           # hashref --key => value
-        nextflow_extra_flags  => [],           # extra flags passed verbatim
-        nextflow_output_dir   => undef,        # passed as --outdir
+        nextflow_binary            => 'nextflow',
+        nextflow_resume_mode       => 'attempt',   # never | attempt | job
+        nextflow_profile           => undef,
+        nextflow_params            => {},           # hashref --key => value
+        nextflow_extra_flags       => [],           # extra flags passed verbatim
+        nextflow_output_dir        => undef,        # passed as --outdir
+        nextflow_dataflow_outputs  => 1,            # read output_manifest.json and dataflow
     };
 }
 
@@ -269,6 +296,60 @@ sub _write_manifest {
     else {
         $self->warning("HiveRunNextflow: could not write manifest to $path: $!");
     }
+}
+
+
+# Read output_manifest.json from --outdir and return the parsed hashref,
+# or undef if the file does not exist or cannot be parsed.
+sub _read_output_manifest {
+    my ($self, $output_dir) = @_;
+
+    my $path = catfile($output_dir, 'output_manifest.json');
+    unless (-f $path) {
+        $self->warning("HiveRunNextflow: no output_manifest.json found at $path — skipping dataflow");
+        return undef;
+    }
+
+    open my $fh, '<', $path
+        or do { $self->warning("HiveRunNextflow: cannot read $path: $!"); return undef; };
+    my $json = do { local $/; <$fh> };
+    close $fh;
+
+    my $manifest = eval { decode_json($json) };
+    if ($@) {
+        $self->warning("HiveRunNextflow: failed to parse $path: $@");
+        return undef;
+    }
+
+    return $manifest;
+}
+
+
+# Called by eHive after run() succeeds. Reads the Nextflow output manifest
+# and fans out one job per output entry on channel 2.
+sub write_output {
+    my ($self) = @_;
+
+    return unless $self->param('nextflow_dataflow_outputs');
+
+    my $output_dir = $self->param('nextflow_output_dir');
+    return unless defined $output_dir;
+
+    my $manifest = $self->_read_output_manifest($output_dir);
+    return unless defined $manifest;
+
+    my $outputs = $manifest->{outputs};
+    unless (ref $outputs eq 'ARRAY' && @$outputs) {
+        $self->warning("HiveRunNextflow: output_manifest.json has no outputs entries — no dataflow on channel 2");
+        return;
+    }
+
+    $self->warning(sprintf("HiveRunNextflow: dataflowing %d output(s) on channel 2", scalar @$outputs));
+    for my $output (@$outputs) {
+        $self->dataflow_output_id($output, 2);
+    }
+
+    return;
 }
 
 
